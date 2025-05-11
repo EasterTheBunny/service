@@ -1,0 +1,9 @@
+with-expecter: True 
+inpackage: False
+filename: "{{.MockName}}.go"
+dir: internal/mocks
+outpkg: mocks
+packages:
+  github.com/easterthebunny/service:
+    interfaces:
+      Runnable:

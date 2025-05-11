@@ -1,0 +1,52 @@
+# Options for analysis running.
+run:
+  # The default concurrency value is the number of available CPU.
+  concurrency: 4
+  # Timeout for analysis, e.g. 30s, 5m.
+  # Default: 1m
+  timeout: 5m
+  # Include test files or not.
+  # Default: true
+  tests: false
+  # If set we pass it to "go list -mod={option}". From "go help modules":
+  # If invoked with -mod=readonly, the go command is disallowed from the implicit
+  # automatic updating of go.mod described above. Instead, it fails when any changes
+  # to go.mod are needed. This setting is most useful to check that go.mod does
+  # not need updates, such as in a continuous integration and testing system.
+  # If invoked with -mod=vendor, the go command assumes that the vendor
+  # directory holds the correct copies of dependencies and ignores
+  # the dependency descriptions in go.mod.
+  #
+  # Allowed values: readonly|vendor|mod
+  # By default, it isn't set.
+  modules-download-mode: vendor
+  # Allow multiple parallel golangci-lint instances running.
+  # If false (default) - golangci-lint acquires file lock on start.
+  allow-parallel-runners: false
+linters:
+  presets:
+    - bugs
+    - error
+    - style
+    - import
+    - performance
+    - complexity
+    - module
+    - test
+    - comment
+  disable:
+    - depguard # need to research config
+    - exhaustruct
+    - godox # need to clear out TODOs
+    - testpackage
+    - nolintlint
+    - gci # need to research rules
+    - tagliatelle # camel case is not preferred
+    - inamedparam # no named parameters on interfaces
+    - goconst # does not appear to function well
+issues:
+  exclude-dirs-use-default: true
+  exclude-rules:
+    - path: recoverable.go
+      linters:
+        - cyclop
