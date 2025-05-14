@@ -4,8 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"log"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -18,7 +17,7 @@ func TestRecoverableService_Recover(t *testing.T) {
 	mr := new(MockRecoverable)
 	mr.chPanic = make(chan error)
 
-	logger := log.New(io.Discard, "", 0)
+	logger := slog.New(slog.DiscardHandler)
 	ctx := t.Context()
 	mr.On("RunWithContext", mock.Anything).Return(fmt.Errorf("done"))
 
@@ -48,7 +47,7 @@ func TestRecoverableService_EndOnError(t *testing.T) {
 	m2 := new(MockRecoverable)
 	mr.chPanic = make(chan error, 2)
 
-	logger := log.New(io.Discard, "", 0)
+	logger := slog.New(slog.DiscardHandler)
 	ctx := t.Context()
 	mr.On("RunWithContext", mock.Anything).Return(fmt.Errorf("done"))
 	m1.On("RunWithContext", mock.Anything).Return(fmt.Errorf("done"))

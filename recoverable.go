@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -31,7 +31,7 @@ type serviceTerm struct {
 	Err error
 }
 
-func NewRecoverableServiceManager(logger *log.Logger) *RecoverableServiceManager {
+func NewRecoverableServiceManager(logger *slog.Logger) *RecoverableServiceManager {
 	return &RecoverableServiceManager{
 		closed:   make(chan serviceTerm, closeQueueLimit),
 		services: make(map[int]Runnable),
@@ -46,7 +46,7 @@ type RecoverableServiceManager struct {
 	services  map[int]Runnable
 	serviceID int
 	active    int
-	log       *log.Logger
+	log       *slog.Logger
 
 	// service life-cycle properties
 	chClose chan struct{}
@@ -126,12 +126,12 @@ func (m *RecoverableServiceManager) Start(ctx context.Context) error {
 func (m *RecoverableServiceManager) runService(ctx context.Context, serviceID int, after time.Duration) {
 	svc := m.services[serviceID]
 
-	go func(idx int, runner Runnable, logger *log.Logger, trm chan serviceTerm, ctx context.Context, aft time.Duration) {
+	go func(idx int, runner Runnable, logger *slog.Logger, trm chan serviceTerm, ctx context.Context, aft time.Duration) {
 		defer func() {
 			if err := recover(); err != nil {
 				// print the stack trace
-				logger.Println(err)
-				logger.Println(string(debug.Stack()))
+				logger.ErrorContext(ctx, fmt.Sprintf("%s", err))
+				logger.DebugContext(ctx, string(debug.Stack()))
 
 				// indicate that service terminated as a panic
 				trm <- serviceTerm{
@@ -150,7 +150,7 @@ func (m *RecoverableServiceManager) runService(ctx context.Context, serviceID in
 
 		err := runner.RunWithContext(ctx)
 
-		logger.Println(err)
+		logger.ErrorContext(ctx, err.Error())
 
 		trm <- serviceTerm{
 			ID:  idx,
