@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -19,7 +20,7 @@ type Runnable interface {
 	// Start should start a service and return an error if startup failed.
 	Start() error
 	// Shutdown should gracefully close the running service and always return an error.
-	Shutdown() error
+	Shutdown(context.Context) error
 	// Close should immediately close the running service and always return an error.
 	Close() error
 }
