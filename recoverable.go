@@ -1,9 +1,9 @@
 package service
 
 import (
-	"context"
 	"errors"
 	"fmt"
+	"log"
 	"log/slog"
 	"runtime/debug"
 	"sync"
@@ -12,107 +12,135 @@ import (
 )
 
 var (
-	ErrServicePanic          = errors.New("service paniced")
 	ErrAllServicesTerminated = errors.New("all services were terminated")
-	ErrCannotAdd             = errors.New("cannot add service")
-)
-
-const (
-	closeQueueLimit = 50
-	recoverWaitTime = 10 * time.Second
 )
 
 type Runnable interface {
-	RunWithContext(context.Context) error
+	// Start should start a service and return an error if startup failed.
+	Start() error
+	// Shutdown should gracefully close the running service and always return an error.
+	Shutdown() error
+	// Close should immediately close the running service and always return an error.
+	Close() error
 }
 
-type serviceTerm struct {
-	ID  int
-	Err error
-}
+type RecoverableServiceManagerOpt func(*RecoverableServiceManager)
 
-func NewRecoverableServiceManager(logger *slog.Logger) *RecoverableServiceManager {
-	return &RecoverableServiceManager{
-		closed:   make(chan serviceTerm, closeQueueLimit),
-		services: make(map[int]Runnable),
-		log:      logger,
-		chClose:  make(chan struct{}, 1),
+func WithLogger(logger *slog.Logger) func(*RecoverableServiceManager) {
+	return func(m *RecoverableServiceManager) {
+		m.log = logger
 	}
+}
+
+func RecoverOnError(m *RecoverableServiceManager) {
+	m.recoverOnError = true
+}
+
+func WithRecoverWait(wait time.Duration) func(*RecoverableServiceManager) {
+	return func(m *RecoverableServiceManager) {
+		m.recoverWaitTime = wait
+	}
+}
+
+func NewRecoverableServiceManager(opts ...RecoverableServiceManagerOpt) *RecoverableServiceManager {
+	manager := &RecoverableServiceManager{
+		recoverWaitTime: defaultRecoverWaitTime,
+		notStarted:      make(map[int]Runnable),
+		running:         make(map[int]Runnable),
+		closed:          make(chan serviceTerm, closeQueueLimit),
+		chClose:         make(chan struct{}),
+	}
+
+	for _, opt := range opts {
+		opt(manager)
+	}
+
+	return manager
 }
 
 type RecoverableServiceManager struct {
-	mu        sync.Mutex
-	closed    chan serviceTerm
-	services  map[int]Runnable
-	serviceID int
-	active    int
-	log       *slog.Logger
+	// provided options
+	log             *slog.Logger
+	recoverOnError  bool
+	recoverWaitTime time.Duration
+
+	// internal state
+	mu         sync.Mutex
+	notStarted map[int]Runnable
+	running    map[int]Runnable
+	active     int
+	serviceID  int
+	closed     chan serviceTerm
 
 	// service life-cycle properties
-	chClose chan struct{}
-	running atomic.Bool
-	closing atomic.Bool
+	chClose  chan struct{}
+	starting atomic.Bool
+	started  atomic.Bool
+	closing  atomic.Bool
 }
 
+// Add will add a Runnable service to the service manager ONLY if the service manager has not yet started.
 func (m *RecoverableServiceManager) Add(svc Runnable) error {
-	if m.running.Load() {
-		return fmt.Errorf("%w: service already running", ErrCannotAdd)
-	}
-
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	id := m.serviceID
 	m.serviceID++
-	m.services[id] = svc
-	m.active++
+	m.notStarted[id] = svc
 
 	return nil
 }
 
-func (m *RecoverableServiceManager) Start(ctx context.Context) error {
-	m.running.Store(true)
+func (m *RecoverableServiceManager) Close() error {
+	m.closing.Store(true)
+	closeService(m.chClose)
 
-	ctx, cancel := context.WithCancel(ctx)
+	m.closing.Store(false)
 
-	for id := range m.services {
-		m.runService(ctx, id, time.Duration(0))
+	return ErrAllServicesTerminated
+}
+
+// Start starts the service manager and all managed services. Start will always return an error. This function will
+// block until Close or Shutdown are called. By default, Start will terminate all services if one returns an error.
+func (m *RecoverableServiceManager) Start() error {
+	if m.started.Load() || m.starting.Load() || m.closing.Load() {
+		return nil
 	}
 
-	for {
-		if m.active == 0 {
-			cancel()
+	m.starting.Store(true)
 
+	for id := range m.notStarted {
+		go m.startService(id, time.Duration(0)) // immediately start all services
+	}
+
+	m.started.Store(true)
+	m.starting.Store(false)
+
+	return m.run()
+}
+
+func (m *RecoverableServiceManager) run() error {
+	for {
+		if m.closing.Load() && m.active == 0 {
 			return ErrAllServicesTerminated
 		}
 
 		select {
 		case svc := <-m.closed:
-			if svc.Err != nil && errors.Is(svc.Err, ErrServicePanic) {
-				// restart the service as a recover
-				m.runService(ctx, svc.ID, recoverWaitTime)
-			} else {
-				if !m.closing.Load() {
-					m.closing.Store(true)
-					closeService(m.chClose)
+			if svc.Err != nil {
+				if errors.Is(svc.Err, errServicePanic) || m.recoverOnError {
+					// restart the service as a recover
+					go m.startService(svc.ID, m.recoverWaitTime)
+
+					continue
 				}
-
-				m.mu.Lock()
-				delete(m.services, svc.ID)
-
-				m.active--
-				m.mu.Unlock()
 			}
-		case <-m.chClose:
-			cancel()
 
 			if !m.closing.Load() {
 				m.closing.Store(true)
 				closeService(m.chClose)
 			}
-
-			continue
-		case <-ctx.Done():
+		case <-m.chClose:
 			if !m.closing.Load() {
 				m.closing.Store(true)
 				closeService(m.chClose)
@@ -123,40 +151,79 @@ func (m *RecoverableServiceManager) Start(ctx context.Context) error {
 	}
 }
 
-func (m *RecoverableServiceManager) runService(ctx context.Context, serviceID int, after time.Duration) {
-	svc := m.services[serviceID]
+func (m *RecoverableServiceManager) startService(serviceID int, after time.Duration) {
+	m.mu.Lock()
+	svc := m.notStarted[serviceID]
+	m.mu.Unlock()
 
-	go func(idx int, runner Runnable, logger *slog.Logger, trm chan serviceTerm, ctx context.Context, aft time.Duration) {
-		defer func() {
-			if err := recover(); err != nil {
-				// print the stack trace
-				logger.ErrorContext(ctx, fmt.Sprintf("%s", err))
-				logger.DebugContext(ctx, string(debug.Stack()))
-
-				// indicate that service terminated as a panic
-				trm <- serviceTerm{
-					ID:  idx,
-					Err: ErrServicePanic,
-				}
+	defer func() {
+		if err := recover(); err != nil {
+			if m.log != nil {
+				log.Println(err)
+				// log the error for better clarity on why the service errored.
+				m.log.Error(fmt.Sprintf("%s", err))
+				// print the stack trace for debugging purposes.
+				m.log.Debug(string(debug.Stack()))
 			}
-		}()
 
-		// exit if the context cancels; wait otherwise
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(aft):
+			m.setInactive(serviceID)
+
+			// indicate that the service terminated as a panic.
+			m.closed <- serviceTerm{
+				ID:  serviceID,
+				Err: errServicePanic,
+			}
 		}
+	}()
 
-		err := runner.RunWithContext(ctx)
+	m.setActive(serviceID)
+	defer m.setInactive(serviceID)
 
-		logger.ErrorContext(ctx, err.Error())
+	// exit if the service manager has closed; wait otherwise
+	select {
+	case <-m.chClose:
+		return
+	case <-time.After(after):
+	}
 
-		trm <- serviceTerm{
-			ID:  idx,
-			Err: err,
-		}
-	}(serviceID, svc, m.log, m.closed, ctx, after)
+	err := svc.Start()
+
+	if m.log != nil && err != nil {
+		m.log.Error(err.Error())
+	}
+
+	m.closed <- serviceTerm{
+		ID:  serviceID,
+		Err: err,
+	}
+}
+
+func (m *RecoverableServiceManager) setActive(serviceID int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	svc, exists := m.notStarted[serviceID]
+	if !exists {
+		return
+	}
+
+	m.running[serviceID] = svc
+	delete(m.notStarted, serviceID)
+	m.active++
+}
+
+func (m *RecoverableServiceManager) setInactive(serviceID int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	svc, exists := m.running[serviceID]
+	if !exists {
+		return
+	}
+
+	m.notStarted[serviceID] = svc
+	delete(m.running, serviceID)
+	m.active--
 }
 
 func closeService(chClose chan struct{}) {
@@ -165,3 +232,15 @@ func closeService(chClose chan struct{}) {
 	default:
 	}
 }
+
+type serviceTerm struct {
+	ID  int
+	Err error
+}
+
+const (
+	closeQueueLimit        = 1
+	defaultRecoverWaitTime = 10 * time.Second
+)
+
+var errServicePanic = errors.New("service paniced")

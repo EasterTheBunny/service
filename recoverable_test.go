@@ -1,106 +1,128 @@
-package service
+package service_test
 
 import (
-	"context"
+	"bytes"
 	"errors"
-	"fmt"
 	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+
+	"github.com/easterthebunny/service"
+	"github.com/easterthebunny/service/internal/mocks"
 )
 
-func TestRecoverableService_Recover(t *testing.T) {
-	mr := new(MockRecoverable)
-	mr.chPanic = make(chan error)
+func TestRecoverableServiceManager_RecoverOnPanic(t *testing.T) {
+	t.Parallel()
 
-	logger := slog.New(slog.DiscardHandler)
-	ctx := t.Context()
-	mr.On("RunWithContext", mock.Anything).Return(fmt.Errorf("done"))
+	mr := new(mocks.MockRunnable)
 
-	rsm := NewRecoverableServiceManager(logger)
-	require.NoError(t, rsm.Add(mr))
+	chPanic := make(chan struct{}, 1)
+	chErr := make(chan struct{}, 1)
 
-	done := make(chan struct{})
-	go func() {
-		assert.ErrorIs(t, rsm.Start(ctx), ErrAllServicesTerminated)
-		done <- struct{}{}
-	}()
-
-	// test that a panic doesn't result in the service ending
-	mr.chPanic <- ErrMockPanic
-
-	select {
-	case <-done:
-		assert.Fail(t, "service terminated when function panic encountered")
-	case <-time.After(1 * time.Second):
-		return
-	}
-}
-
-func TestRecoverableService_EndOnError(t *testing.T) {
-	mr := new(MockRecoverable)
-	m1 := new(MockRecoverable)
-	m2 := new(MockRecoverable)
-	mr.chPanic = make(chan error, 2)
-
-	logger := slog.New(slog.DiscardHandler)
-	ctx := t.Context()
-	mr.On("RunWithContext", mock.Anything).Return(fmt.Errorf("done"))
-	m1.On("RunWithContext", mock.Anything).Return(fmt.Errorf("done"))
-	m2.On("RunWithContext", mock.Anything).Return(fmt.Errorf("done"))
-
-	rsm := NewRecoverableServiceManager(logger)
-
-	require.NoError(t, rsm.Add(mr))
-	require.NoError(t, rsm.Add(m1))
-	require.NoError(t, rsm.Add(m2))
-
-	done := make(chan struct{})
-	go func() {
-		assert.ErrorIs(t, rsm.Start(ctx), ErrAllServicesTerminated)
-		done <- struct{}{}
-	}()
-
-	<-time.After(500 * time.Millisecond)
-	// test that a panic doesn't result in the service panicing
-	mr.chPanic <- nil
-
-	select {
-	case <-done:
-		return
-	case <-time.After(1 * time.Second):
-		assert.Fail(t, "service should have ended")
-	}
-}
-
-var ErrMockPanic = fmt.Errorf("panic")
-
-type MockRecoverable struct {
-	mock.Mock
-	running bool
-	chPanic chan error
-}
-
-func (_m *MockRecoverable) RunWithContext(ctx context.Context) error {
-	ret := _m.Mock.Called(ctx)
-	_m.running = true
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case err := <-_m.chPanic:
-		if err == nil {
-			return ret.Error(0)
+	mr.EXPECT().Start().RunAndReturn(func() error {
+		select {
+		case <-chPanic:
+			chErr <- struct{}{}
+			panic("panic")
+		case <-chErr:
+			return errors.New("test")
+		case <-t.Context().Done():
+			return errors.New("context done")
 		}
+	}).Times(2)
 
-		if errors.Is(err, ErrMockPanic) {
-			panic(err)
+	manager := service.NewRecoverableServiceManager(
+		service.WithRecoverWait(100 * time.Millisecond),
+	)
+
+	require.NoError(t, manager.Add(mr))
+	t.Cleanup(func() {
+		_ = manager.Close()
+	})
+
+	chPanic <- struct{}{}
+
+	require.ErrorIs(t, manager.Start(), service.ErrAllServicesTerminated)
+	mr.AssertExpectations(t)
+}
+
+func TestRecoverableServiceManager_RecoverOnError(t *testing.T) {
+	t.Parallel()
+
+	mr := new(mocks.MockRunnable)
+
+	chPanic := make(chan struct{}, 1)
+	chErr := make(chan struct{}, 1)
+	chClose := make(chan struct{}, 1)
+
+	manager := service.NewRecoverableServiceManager(
+		service.RecoverOnError,
+		service.WithRecoverWait(100*time.Millisecond),
+	)
+
+	mr.EXPECT().Start().RunAndReturn(func() error {
+		select {
+		case <-chPanic:
+			chErr <- struct{}{}
+			panic("panic")
+		case <-chErr:
+			chClose <- struct{}{}
+			return errors.New("service error")
+		case <-chClose:
+			manager.Close()
+			return nil
+		case <-t.Context().Done():
+			return errors.New("context done")
 		}
+	}).Times(3)
 
-		return err
-	}
+	require.NoError(t, manager.Add(mr))
+
+	chPanic <- struct{}{}
+
+	require.ErrorIs(t, manager.Start(), service.ErrAllServicesTerminated)
+	mr.AssertExpectations(t)
+}
+
+func TestRecoverableServiceManager_ServiceErrorsLogged(t *testing.T) {
+	t.Parallel()
+
+	writer := bytes.NewBuffer([]byte{})
+	mr := new(mocks.MockRunnable)
+	logger := slog.New(slog.NewTextHandler(writer, &slog.HandlerOptions{
+		Level: slog.LevelError,
+	}))
+
+	chErr := make(chan struct{}, 1)
+	chClose := make(chan struct{}, 1)
+
+	manager := service.NewRecoverableServiceManager(
+		service.RecoverOnError,
+		service.WithLogger(logger),
+		service.WithRecoverWait(100*time.Millisecond),
+	)
+
+	mr.EXPECT().Start().RunAndReturn(func() error {
+		select {
+		case <-chErr:
+			chClose <- struct{}{}
+			return errors.New("service error")
+		case <-chClose:
+			manager.Close()
+			return nil
+		case <-t.Context().Done():
+			return errors.New("context done")
+		}
+	}).Times(2)
+
+	require.NoError(t, manager.Add(mr))
+
+	chErr <- struct{}{}
+
+	require.ErrorIs(t, manager.Start(), service.ErrAllServicesTerminated)
+	mr.AssertExpectations(t)
+	assert.Contains(t, writer.String(), "service error")
 }
