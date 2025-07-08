@@ -126,3 +126,45 @@ func TestRecoverableServiceManager_ServiceErrorsLogged(t *testing.T) {
 	mr.AssertExpectations(t)
 	assert.Contains(t, writer.String(), "service error")
 }
+
+func TestRecoverableServiceManager_Close(t *testing.T) {
+	t.Parallel()
+
+	mr := new(mocks.MockRunnable)
+
+	chStarted := make(chan struct{})
+	chRunnable := make(chan struct{})
+
+	mr.EXPECT().Start().RunAndReturn(func() error {
+		close(chStarted)
+
+		select {
+		case <-chRunnable:
+			return errors.New("closed")
+		case <-t.Context().Done():
+			return errors.New("context done")
+		}
+	}).Once()
+
+	mr.EXPECT().Close().RunAndReturn(func() error {
+		close(chRunnable)
+
+		return errors.New("closed")
+	})
+
+	manager := service.NewRecoverableServiceManager(
+		service.WithRecoverWait(100 * time.Millisecond),
+	)
+
+	require.NoError(t, manager.Add(mr))
+
+	go func() {
+		require.ErrorIs(t, manager.Start(), service.ErrAllServicesTerminated)
+	}()
+
+	<-chStarted
+	time.Sleep(100 * time.Millisecond)
+	require.ErrorIs(t, manager.Close(), service.ErrAllServicesTerminated)
+
+	mr.AssertExpectations(t)
+}

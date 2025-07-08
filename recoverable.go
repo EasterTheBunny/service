@@ -96,9 +96,17 @@ func (m *RecoverableServiceManager) Close() error {
 	m.closing.Store(true)
 	closeService(m.chClose)
 
+	err := ErrAllServicesTerminated
+
+	m.mu.Lock()
+	for _, svc := range m.running {
+		err = errors.Join(err, svc.Close())
+	}
+	m.mu.Unlock()
+
 	m.closing.Store(false)
 
-	return ErrAllServicesTerminated
+	return err
 }
 
 // Start starts the service manager and all managed services. Start will always return an error. This function will
