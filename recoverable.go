@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"maps"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -69,7 +70,7 @@ type RecoverableServiceManager struct {
 	mu         sync.Mutex
 	notStarted map[int]Runnable
 	running    map[int]Runnable
-	active     int
+	active     atomic.Int32
 	serviceID  int
 	closed     chan serviceTerm
 
@@ -101,6 +102,8 @@ func (m *RecoverableServiceManager) Close() error {
 	m.mu.Lock()
 	for _, svc := range m.running {
 		err = errors.Join(err, svc.Close())
+
+		m.active.Add(-1)
 	}
 	m.mu.Unlock()
 
@@ -113,12 +116,16 @@ func (m *RecoverableServiceManager) Close() error {
 // block until Close or Shutdown are called. By default, Start will terminate all services if one returns an error.
 func (m *RecoverableServiceManager) Start() error {
 	if m.started.Load() || m.starting.Load() || m.closing.Load() {
-		return nil
+		return ErrAllServicesTerminated
 	}
 
 	m.starting.Store(true)
 
-	for id := range m.notStarted {
+	m.mu.Lock()
+	ids := maps.Keys(m.notStarted)
+	m.mu.Unlock()
+
+	for id := range ids {
 		go m.startService(id, time.Duration(0)) // immediately start all services
 	}
 
@@ -130,8 +137,12 @@ func (m *RecoverableServiceManager) Start() error {
 
 func (m *RecoverableServiceManager) run() error {
 	for {
-		if m.closing.Load() && m.active == 0 {
-			return ErrAllServicesTerminated
+		if m.closing.Load() {
+			if m.active.Load() == 0 {
+				return ErrAllServicesTerminated
+			}
+
+			continue
 		}
 
 		select {
@@ -201,9 +212,11 @@ func (m *RecoverableServiceManager) startService(serviceID int, after time.Durat
 		m.log.Error(err.Error())
 	}
 
-	m.closed <- serviceTerm{
-		ID:  serviceID,
-		Err: err,
+	if !m.closing.Load() {
+		m.closed <- serviceTerm{
+			ID:  serviceID,
+			Err: err,
+		}
 	}
 }
 
@@ -218,7 +231,7 @@ func (m *RecoverableServiceManager) setActive(serviceID int) {
 
 	m.running[serviceID] = svc
 	delete(m.notStarted, serviceID)
-	m.active++
+	m.active.Add(1)
 }
 
 func (m *RecoverableServiceManager) setInactive(serviceID int) {
@@ -232,7 +245,7 @@ func (m *RecoverableServiceManager) setInactive(serviceID int) {
 
 	m.notStarted[serviceID] = svc
 	delete(m.running, serviceID)
-	m.active--
+	m.active.Add(-1)
 }
 
 func closeService(chClose chan struct{}) {
