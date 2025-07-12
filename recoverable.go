@@ -49,7 +49,7 @@ func NewRecoverableServiceManager(opts ...RecoverableServiceManagerOpt) *Recover
 		recoverWaitTime: defaultRecoverWaitTime,
 		notStarted:      make(map[int]Runnable),
 		running:         make(map[int]Runnable),
-		closed:          make(chan serviceTerm, closeQueueLimit),
+		exited:          make(chan serviceTerm, closeQueueLimit),
 		chClose:         make(chan struct{}),
 	}
 
@@ -72,7 +72,7 @@ type RecoverableServiceManager struct {
 	running    map[int]Runnable
 	active     atomic.Int32
 	serviceID  int
-	closed     chan serviceTerm
+	exited     chan serviceTerm
 
 	// service life-cycle properties
 	chClose  chan struct{}
@@ -94,6 +94,13 @@ func (m *RecoverableServiceManager) Add(svc Runnable) error {
 }
 
 func (m *RecoverableServiceManager) Close() error {
+	// 1. lock services from being started
+	// 2. lock services from being added
+	// 3. set started and starting states to false
+	// 4. call Close on all running services
+	// 5. set closing state to false
+	// 6. return ErrAllServicesTerminated joined with all service close errors
+
 	m.closing.Store(true)
 	closeService(m.chClose)
 
@@ -108,6 +115,8 @@ func (m *RecoverableServiceManager) Close() error {
 	m.mu.Unlock()
 
 	m.closing.Store(false)
+	m.started.Store(false)
+	m.starting.Store(false)
 
 	return err
 }
@@ -115,12 +124,18 @@ func (m *RecoverableServiceManager) Close() error {
 // Start starts the service manager and all managed services. Start will always return an error. This function will
 // block until Close or Shutdown are called. By default, Start will terminate all services if one returns an error.
 func (m *RecoverableServiceManager) Start() error {
+	// 1. return error for conflicting states
+	//   a. already started ErrServiceRunning
+	//   b. already starting ErrServiceStarting
+	//   c. closing ErrServiceClosing
 	if m.started.Load() || m.starting.Load() || m.closing.Load() {
 		return ErrAllServicesTerminated
 	}
 
+	// 2. set state to starting
 	m.starting.Store(true)
 
+	// 3. start all registered services
 	m.mu.Lock()
 	ids := maps.Keys(m.notStarted)
 	m.mu.Unlock()
@@ -129,6 +144,7 @@ func (m *RecoverableServiceManager) Start() error {
 		go m.startService(id, time.Duration(0)) // immediately start all services
 	}
 
+	// 4. set state to started
 	m.started.Store(true)
 	m.starting.Store(false)
 
@@ -138,7 +154,7 @@ func (m *RecoverableServiceManager) Start() error {
 func (m *RecoverableServiceManager) run() error {
 	for {
 		if m.closing.Load() {
-			if m.active.Load() == 0 {
+			if m.active.Load() <= 0 {
 				return ErrAllServicesTerminated
 			}
 
@@ -146,7 +162,8 @@ func (m *RecoverableServiceManager) run() error {
 		}
 
 		select {
-		case svc := <-m.closed:
+		// every time a service exits, restart it
+		case svc := <-m.exited:
 			if svc.Err != nil {
 				if errors.Is(svc.Err, errServicePanic) || m.recoverOnError {
 					// restart the service as a recover
@@ -156,6 +173,8 @@ func (m *RecoverableServiceManager) run() error {
 				}
 			}
 
+			// if the exit reason is not a panic and recoverOnError is false
+			// start closing services
 			if !m.closing.Load() {
 				m.closing.Store(true)
 				closeService(m.chClose)
@@ -172,10 +191,6 @@ func (m *RecoverableServiceManager) run() error {
 }
 
 func (m *RecoverableServiceManager) startService(serviceID int, after time.Duration) {
-	m.mu.Lock()
-	svc := m.notStarted[serviceID]
-	m.mu.Unlock()
-
 	defer func() {
 		if err := recover(); err != nil {
 			if m.log != nil {
@@ -188,15 +203,17 @@ func (m *RecoverableServiceManager) startService(serviceID int, after time.Durat
 
 			m.setInactive(serviceID)
 
-			// indicate that the service terminated as a panic.
-			m.closed <- serviceTerm{
-				ID:  serviceID,
-				Err: errServicePanic,
+			if !m.closing.Load() {
+				// indicate that the service terminated as a panic.
+				m.exited <- serviceTerm{
+					ID:  serviceID,
+					Err: errServicePanic,
+				}
 			}
 		}
 	}()
 
-	m.setActive(serviceID)
+	svc := m.setActive(serviceID)
 	defer m.setInactive(serviceID)
 
 	// exit if the service manager has closed; wait otherwise
@@ -206,32 +223,34 @@ func (m *RecoverableServiceManager) startService(serviceID int, after time.Durat
 	case <-time.After(after):
 	}
 
+	// blocks until error
 	err := svc.Start()
 
-	if m.log != nil && err != nil {
-		m.log.Error(err.Error())
-	}
-
 	if !m.closing.Load() {
-		m.closed <- serviceTerm{
+		if m.log != nil && err != nil {
+			m.log.Error(err.Error())
+		}
+
+		m.exited <- serviceTerm{
 			ID:  serviceID,
 			Err: err,
 		}
 	}
 }
 
-func (m *RecoverableServiceManager) setActive(serviceID int) {
+func (m *RecoverableServiceManager) setActive(serviceID int) Runnable {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	svc, exists := m.notStarted[serviceID]
 	if !exists {
-		return
+		return nil
 	}
 
 	m.running[serviceID] = svc
 	delete(m.notStarted, serviceID)
-	m.active.Add(1)
+
+	return svc
 }
 
 func (m *RecoverableServiceManager) setInactive(serviceID int) {
@@ -245,7 +264,6 @@ func (m *RecoverableServiceManager) setInactive(serviceID int) {
 
 	m.notStarted[serviceID] = svc
 	delete(m.running, serviceID)
-	m.active.Add(-1)
 }
 
 func closeService(chClose chan struct{}) {

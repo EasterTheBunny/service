@@ -51,8 +51,6 @@ func TestRecoverableServiceManager_RecoverOnPanic(t *testing.T) {
 
 func TestRecoverableServiceManager_RecoverOnError(t *testing.T) {
 	t.Parallel()
-	t.Log("RecoverOnError is not yet functional")
-	t.Skip()
 
 	mr := new(mocks.MockRunnable)
 
@@ -94,8 +92,6 @@ func TestRecoverableServiceManager_RecoverOnError(t *testing.T) {
 
 func TestRecoverableServiceManager_ServiceErrorsLogged(t *testing.T) {
 	t.Parallel()
-	t.Log("RecoverOnError is not yet functional")
-	t.Skip()
 
 	writer := bytes.NewBuffer([]byte{})
 	mr := new(mocks.MockRunnable)
@@ -119,11 +115,14 @@ func TestRecoverableServiceManager_ServiceErrorsLogged(t *testing.T) {
 			return errors.New("service error")
 		case <-chClose:
 			manager.Close()
-			return nil
+			return errors.New("closing")
 		case <-t.Context().Done():
+			manager.Close()
 			return errors.New("context done")
 		}
 	}).Times(2)
+
+	mr.EXPECT().Close().Return(nil)
 
 	require.NoError(t, manager.Add(mr))
 
