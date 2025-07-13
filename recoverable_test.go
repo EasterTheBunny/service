@@ -35,7 +35,7 @@ func TestRecoverableServiceManager_RecoverOnPanic(t *testing.T) {
 	}).Times(2)
 
 	manager := service.NewRecoverableServiceManager(
-		service.WithRecoverWait(100 * time.Millisecond),
+		service.WithRecoveryStrategy(service.NewExponentialRecoveryStrategy(100 * time.Millisecond)),
 	)
 
 	require.NoError(t, manager.Add(mr))
@@ -60,7 +60,7 @@ func TestRecoverableServiceManager_RecoverOnError(t *testing.T) {
 
 	manager := service.NewRecoverableServiceManager(
 		service.RecoverOnError,
-		service.WithRecoverWait(100*time.Millisecond),
+		service.WithRecoveryStrategy(service.NewExponentialRecoveryStrategy(100*time.Millisecond)),
 	)
 
 	mr.EXPECT().Start().RunAndReturn(func() error {
@@ -105,7 +105,7 @@ func TestRecoverableServiceManager_ServiceErrorsLogged(t *testing.T) {
 	manager := service.NewRecoverableServiceManager(
 		service.RecoverOnError,
 		service.WithLogger(logger),
-		service.WithRecoverWait(100*time.Millisecond),
+		service.WithRecoveryStrategy(service.NewExponentialRecoveryStrategy(100*time.Millisecond)),
 	)
 
 	mr.EXPECT().Start().RunAndReturn(func() error {
@@ -162,8 +162,8 @@ func TestRecoverableServiceManager_Close(t *testing.T) {
 	}).Once()
 
 	manager := service.NewRecoverableServiceManager(
-		service.WithRecoverWait(100*time.Millisecond),
 		service.RecoverOnError,
+		service.WithRecoveryStrategy(service.NewExponentialRecoveryStrategy(100*time.Millisecond)),
 	)
 
 	require.NoError(t, manager.Add(mr))

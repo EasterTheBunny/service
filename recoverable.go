@@ -38,23 +38,59 @@ func RecoverOnError(m *RecoverableServiceManager) {
 	m.recoverOnError = true
 }
 
-func WithRecoverWait(wait time.Duration) func(*RecoverableServiceManager) {
+type RecoveryStrategy interface {
+	Wait() (time.Duration, bool)
+}
+
+type ExponentialRecoveryStrategy struct {
+	mu       sync.Mutex
+	factor   int64
+	nextWait time.Duration
+	max      time.Duration
+}
+
+func NewExponentialRecoveryStrategy(initial time.Duration) *ExponentialRecoveryStrategy {
+	return &ExponentialRecoveryStrategy{
+		factor:   2,
+		nextWait: time.Second,
+		max:      60 * time.Second,
+	}
+}
+
+func (s *ExponentialRecoveryStrategy) Wait() (time.Duration, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	next := s.nextWait
+	if next > s.max {
+		return 0, false
+	}
+
+	s.nextWait = s.nextWait * 2
+
+	return next, true
+}
+
+func WithRecoveryStrategy(strategy RecoveryStrategy) func(*RecoverableServiceManager) {
 	return func(m *RecoverableServiceManager) {
-		m.recoverWaitTime = wait
+		m.recovery = strategy
 	}
 }
 
 func NewRecoverableServiceManager(opts ...RecoverableServiceManagerOpt) *RecoverableServiceManager {
 	manager := &RecoverableServiceManager{
-		recoverWaitTime: defaultRecoverWaitTime,
-		notStarted:      make(map[int]Runnable),
-		running:         make(map[int]Runnable),
-		exited:          make(chan serviceTerm, closeQueueLimit),
-		chClose:         make(chan struct{}),
+		notStarted: make(map[int]Runnable),
+		running:    make(map[int]Runnable),
+		exited:     make(chan serviceTerm, closeQueueLimit),
+		chClose:    make(chan struct{}),
 	}
 
 	for _, opt := range opts {
 		opt(manager)
+	}
+
+	if manager.recovery == nil {
+		manager.recovery = NewExponentialRecoveryStrategy(time.Second)
 	}
 
 	return manager
@@ -62,9 +98,9 @@ func NewRecoverableServiceManager(opts ...RecoverableServiceManagerOpt) *Recover
 
 type RecoverableServiceManager struct {
 	// provided options
-	log             *slog.Logger
-	recoverOnError  bool
-	recoverWaitTime time.Duration
+	log            *slog.Logger
+	recoverOnError bool
+	recovery       RecoveryStrategy
 
 	// internal state
 	mu         sync.Mutex
@@ -164,13 +200,20 @@ func (m *RecoverableServiceManager) run() error {
 		select {
 		// every time a service exits, restart it
 		case svc := <-m.exited:
-			if svc.Err != nil {
-				if errors.Is(svc.Err, errServicePanic) || m.recoverOnError {
-					// restart the service as a recover
-					go m.startService(svc.ID, m.recoverWaitTime)
-
-					continue
+			if svc.Err != nil && (errors.Is(svc.Err, errServicePanic) || m.recoverOnError) {
+				tm, ok := m.recovery.Wait()
+				if !ok && !m.closing.Load() {
+					// should stop the service and return an error
+					m.closing.Store(true)
+					closeService(m.chClose)
 				}
+
+				if !m.closing.Load() {
+					// restart the service as a recover
+					go m.startService(svc.ID, tm)
+				}
+
+				continue
 			}
 
 			// if the exit reason is not a panic and recoverOnError is false
