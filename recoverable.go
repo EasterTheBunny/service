@@ -34,8 +34,11 @@ func WithLogger(logger *slog.Logger) func(*RecoverableServiceManager) {
 	}
 }
 
-func RecoverOnError(m *RecoverableServiceManager) {
-	m.recoverOnError = true
+func RecoverOnErrorExcept(errs ...error) func(*RecoverableServiceManager) {
+	return func(m *RecoverableServiceManager) {
+		m.recoverOnError = true
+		m.recoverOnErrorOpts = errs
+	}
 }
 
 type RecoveryStrategy interface {
@@ -79,10 +82,11 @@ func WithRecoveryStrategy(strategy RecoveryStrategy) func(*RecoverableServiceMan
 
 func NewRecoverableServiceManager(opts ...RecoverableServiceManagerOpt) *RecoverableServiceManager {
 	manager := &RecoverableServiceManager{
-		notStarted: make(map[int]Runnable),
-		running:    make(map[int]Runnable),
-		exited:     make(chan serviceTerm, closeQueueLimit),
-		chClose:    make(chan struct{}),
+		recoverOnErrorOpts: make([]error, 0),
+		notStarted:         make(map[int]Runnable),
+		running:            make(map[int]Runnable),
+		exited:             make(chan serviceTerm, closeQueueLimit),
+		chClose:            make(chan struct{}),
 	}
 
 	for _, opt := range opts {
@@ -98,9 +102,10 @@ func NewRecoverableServiceManager(opts ...RecoverableServiceManagerOpt) *Recover
 
 type RecoverableServiceManager struct {
 	// provided options
-	log            *slog.Logger
-	recoverOnError bool
-	recovery       RecoveryStrategy
+	log                *slog.Logger
+	recoverOnError     bool
+	recoverOnErrorOpts []error
+	recovery           RecoveryStrategy
 
 	// internal state
 	mu         sync.Mutex
@@ -199,6 +204,19 @@ func (m *RecoverableServiceManager) run() error {
 		// every time a service exits, restart it
 		case svc := <-m.exited:
 			if svc.Err != nil && (errors.Is(svc.Err, errServicePanic) || m.recoverOnError) {
+				if !errors.Is(svc.Err, errServicePanic) && m.recoverOnError {
+					// check for errors that can be skipped
+					for _, err := range m.recoverOnErrorOpts {
+						if errors.Is(svc.Err, err) {
+							// should stop the service and return an error
+							m.closing.Store(true)
+							closeService(m.chClose)
+
+							continue
+						}
+					}
+				}
+
 				tm, ok := m.recovery.Wait()
 				if !ok && !m.closing.Load() {
 					// should stop the service and return an error

@@ -52,42 +52,79 @@ func TestRecoverableServiceManager_RecoverOnPanic(t *testing.T) {
 func TestRecoverableServiceManager_RecoverOnError(t *testing.T) {
 	t.Parallel()
 
-	mr := new(mocks.MockRunnable)
+	t.Run("no error exceptions defined", func(t *testing.T) {
+		t.Parallel()
 
-	chPanic := make(chan struct{}, 1)
-	chErr := make(chan struct{}, 1)
-	chClose := make(chan struct{}, 1)
+		mr := new(mocks.MockRunnable)
 
-	manager := service.NewRecoverableServiceManager(
-		service.RecoverOnError,
-		service.WithRecoveryStrategy(service.NewExponentialRecoveryStrategy(100*time.Millisecond)),
-	)
+		chPanic := make(chan struct{}, 1)
+		chErr := make(chan struct{}, 1)
+		chClose := make(chan struct{}, 1)
 
-	mr.EXPECT().Start().RunAndReturn(func() error {
-		t.Log("run and return")
-		select {
-		case <-chPanic:
-			chErr <- struct{}{}
-			panic("panic")
-		case <-chErr:
-			chClose <- struct{}{}
-			return errors.New("service error")
-		case <-chClose:
-			t.Log("closing")
-			_ = manager.Close()
-			return nil
-		case <-t.Context().Done():
-			return errors.New("context done")
-		}
-	}).Times(3)
+		manager := service.NewRecoverableServiceManager(
+			service.RecoverOnErrorExcept(),
+			service.WithRecoveryStrategy(service.NewExponentialRecoveryStrategy(100*time.Millisecond)),
+		)
 
-	require.NoError(t, manager.Add(mr))
+		mr.EXPECT().Start().RunAndReturn(func() error {
+			select {
+			case <-chPanic:
+				chErr <- struct{}{}
+				panic("panic")
+			case <-chErr:
+				chClose <- struct{}{}
+				return errors.New("service error")
+			case <-chClose:
+				_ = manager.Close()
+				return nil
+			case <-t.Context().Done():
+				return errors.New("context done")
+			}
+		}).Times(3)
 
-	chPanic <- struct{}{}
+		require.NoError(t, manager.Add(mr))
 
-	t.Log("start")
-	require.ErrorIs(t, manager.Start(), service.ErrAllServicesTerminated)
-	mr.AssertExpectations(t)
+		chPanic <- struct{}{}
+
+		require.ErrorIs(t, manager.Start(), service.ErrAllServicesTerminated)
+		mr.AssertExpectations(t)
+	})
+
+	t.Run("only on errors not in set", func(t *testing.T) {
+		t.Parallel()
+
+		mr := new(mocks.MockRunnable)
+		chErr1 := make(chan struct{}, 1)
+		chErr2 := make(chan struct{}, 1)
+		skipRestartErr := errors.New("exception")
+
+		manager := service.NewRecoverableServiceManager(
+			service.RecoverOnErrorExcept(skipRestartErr),
+			service.WithRecoveryStrategy(service.NewExponentialRecoveryStrategy(100*time.Millisecond)),
+		)
+
+		mr.EXPECT().Start().RunAndReturn(func() error {
+			select {
+			case <-chErr1:
+				chErr2 <- struct{}{}
+
+				return errors.New("basic error")
+			case <-chErr2:
+				return skipRestartErr
+			case <-t.Context().Done():
+				_ = manager.Close()
+
+				return nil
+			}
+		}).Times(2)
+
+		require.NoError(t, manager.Add(mr))
+
+		chErr1 <- struct{}{}
+
+		require.ErrorIs(t, manager.Start(), service.ErrAllServicesTerminated)
+		mr.AssertExpectations(t)
+	})
 }
 
 func TestRecoverableServiceManager_ServiceErrorsLogged(t *testing.T) {
@@ -103,7 +140,7 @@ func TestRecoverableServiceManager_ServiceErrorsLogged(t *testing.T) {
 	chClose := make(chan struct{}, 1)
 
 	manager := service.NewRecoverableServiceManager(
-		service.RecoverOnError,
+		service.RecoverOnErrorExcept(),
 		service.WithLogger(logger),
 		service.WithRecoveryStrategy(service.NewExponentialRecoveryStrategy(100*time.Millisecond)),
 	)
@@ -162,7 +199,7 @@ func TestRecoverableServiceManager_Close(t *testing.T) {
 	}).Once()
 
 	manager := service.NewRecoverableServiceManager(
-		service.RecoverOnError,
+		service.RecoverOnErrorExcept(),
 		service.WithRecoveryStrategy(service.NewExponentialRecoveryStrategy(100*time.Millisecond)),
 	)
 
