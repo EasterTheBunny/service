@@ -173,12 +173,10 @@ func (m *RecoverableServiceManager) Start() error {
 
 	// 3. start all registered services
 	m.mu.Lock()
-	ids := maps.Keys(m.notStarted)
-	m.mu.Unlock()
-
-	for id := range ids {
+	for id := range maps.Keys(m.notStarted) {
 		go m.startService(id, time.Duration(0)) // immediately start all services
 	}
+	m.mu.Unlock()
 
 	// 4. set state to started
 	m.started.Store(true)
